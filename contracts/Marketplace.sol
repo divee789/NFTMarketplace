@@ -16,17 +16,22 @@ contract NFTMarket is ReentrancyGuard, Ownable {
 
     uint256 listingPrice;
 
+    // 1 -- false, Fixed
+    // 2 -- true, Auction
+
     struct MarketItem {
         address nftContract;
+        address originalCreator;
         address payable seller;
         address payable owner;
         address payable currentBidder;
         uint256 itemId;
         uint256 price;
+        uint256 sellPrice;
         uint256 sold;
         uint256 tokenId;
         uint256 currentBid;
-        bytes32 marketType;
+        uint256 marketType;
     }
 
     mapping(uint256 => MarketItem) public idToMarketItem;
@@ -46,18 +51,6 @@ contract NFTMarket is ReentrancyGuard, Ownable {
 
     event Bid(address bidder, uint256 bid, uint256 itemId);
 
-    modifier notMarketItemOwner(uint256 id) {
-        MarketItem memory item = idToMarketItem[id];
-        if (msg.sender == item.seller) revert();
-        _;
-    }
-
-    modifier marketItemOwner(uint256 id) {
-        MarketItem memory item = idToMarketItem[id];
-        if (msg.sender != item.seller) revert();
-        _;
-    }
-
     /* Returns the listing price of the contract */
     function getListingPrice() public view returns (uint256) {
         return listingPrice;
@@ -74,39 +67,46 @@ contract NFTMarket is ReentrancyGuard, Ownable {
         address nftContract,
         uint256 tokenId,
         uint256 price,
-        bytes32 marketType
+        uint256 marketType
     ) public payable nonReentrant {
         require(price > 0, "Price must be greater than 0");
         require(
             msg.value == listingPrice,
             "Value must be equal to listing price"
         );
+        require(
+            marketType == 1 || marketType == 2,
+            "Market type must be either Auction or Fixed"
+        );
+
+        IERC721(nftContract).transferFrom(msg.sender, address(this), tokenId);
+        (bool success, ) = payable(owner()).call{value: listingPrice}("");
+        require(success, "Failed to transfer lisiting price to market owner");
 
         _itemIds.increment();
         uint256 itemId = _itemIds.current();
 
         idToMarketItem[itemId] = MarketItem(
             nftContract,
+            msg.sender,
             payable(msg.sender),
             payable(address(this)),
             payable(msg.sender),
             itemId,
             price,
+            0,
             1,
             tokenId,
             0,
             marketType
         );
 
-        IERC721(nftContract).transferFrom(msg.sender, address(this), tokenId);
-        payable(owner()).transfer(listingPrice);
-
         emit MarketItemCreated(
             itemId,
             nftContract,
             tokenId,
             msg.sender,
-            address(0),
+            address(this),
             price,
             1
         );
@@ -116,10 +116,14 @@ contract NFTMarket is ReentrancyGuard, Ownable {
     function bidForMarketItem(uint256 itemId) public payable nonReentrant {
         require(msg.value > 0, "Bid must be greater than 0");
         require(
-            idToMarketItem[itemId].marketType == "Auction",
+            idToMarketItem[itemId].marketType == 2,
             "Only auctions can be bidded on"
         );
         require(idToMarketItem[itemId].sold == 1, "Item has already been sold");
+        require(
+            msg.sender != idToMarketItem[itemId].seller,
+            "You cannot bid on your own item"
+        );
         uint256 bidderOld = fundsByBidder[itemId][msg.sender];
         uint256 minBid = (
             idToMarketItem[itemId].currentBid == 0
@@ -129,7 +133,7 @@ contract NFTMarket is ReentrancyGuard, Ownable {
         if (bidderOld == 0) {
             require(
                 msg.value > minBid,
-                "Bid must be greater than the current bid"
+                "Your bid must be greater than the current bid"
             );
             auctionItemNumberOfBidders[itemId]++;
             auctionItemBidders[itemId].push(msg.sender);
@@ -148,40 +152,66 @@ contract NFTMarket is ReentrancyGuard, Ownable {
     /* End Auction */
     /* Transfers ownership of the item, as well as funds between parties */
     /* Returns bids back to the bidders */
-    function endAuction(uint256 itemId)
-        public
-        payable
-        nonReentrant
-        marketItemOwner(itemId)
-    {
+    function endAuction(uint256 itemId) public nonReentrant {
+        MarketItem memory item = idToMarketItem[itemId];
+
+        require(
+            msg.sender == item.seller,
+            "Ownable: Only auction owner can end auction"
+        );
+
         uint256 currentBid = idToMarketItem[itemId].currentBid;
         uint256 tokenId = idToMarketItem[itemId].tokenId;
-        idToMarketItem[itemId].seller.transfer(currentBid);
+
+        (bool success, ) = idToMarketItem[itemId].seller.call{
+            value: currentBid
+        }("");
+        require(success, "Transfer of funds to seller failed.");
+
         IERC721(idToMarketItem[itemId].nftContract).transferFrom(
             address(this),
             idToMarketItem[itemId].currentBidder,
             tokenId
         );
+
         uint256 numberOfBidders = auctionItemNumberOfBidders[itemId];
+
         for (uint256 i = 0; i < numberOfBidders; i++) {
             address bidderToRefund = auctionItemBidders[itemId][i];
+
             if (bidderToRefund == idToMarketItem[itemId].currentBidder) {
                 continue;
             }
+
             uint256 bidToBeRefunded = fundsByBidder[itemId][bidderToRefund];
-            payable(bidderToRefund).transfer(bidToBeRefunded);
+            (bool successful, ) = payable(bidderToRefund).call{
+                value: bidToBeRefunded
+            }("");
+            require(successful, "Refund failed");
+
+            // delete fundsByBidder[itemId][bidderToRefund];
+            // delete auctionItemBidders[itemId][i];
         }
-        idToMarketItem[itemId].owner = payable(msg.sender);
+        idToMarketItem[itemId].owner = payable(
+            idToMarketItem[itemId].currentBidder
+        );
+        idToMarketItem[itemId].seller = payable(
+            idToMarketItem[itemId].currentBidder
+        );
         idToMarketItem[itemId].sold = 2;
+
         idToMarketItem[itemId].currentBid = 0;
+
+        idToMarketItem[itemId].sellPrice = currentBid;
     }
 
     /* Places a previously sold item for sale on the marketplace */
     /* marketType can either be Auction or Fixed */
+    /*The owner of the NFT must first approve this contract before calling this function */
     function resellMarketItem(
         uint256 itemId,
         uint256 price,
-        bytes32 marketType
+        uint256 marketType
     ) public payable nonReentrant {
         require(idToMarketItem[itemId].sold == 2, "Item has not been sold");
         require(price > 0, "Price must be greater than 0");
@@ -189,7 +219,10 @@ contract NFTMarket is ReentrancyGuard, Ownable {
             listingPrice == msg.value,
             "Value must be equal to listing price"
         );
-        require(marketType == "Auction" || marketType == "Fixed", "marketType must be either Auction or Fixed");
+        require(
+            marketType == 1 || marketType == 2,
+            "marketType must be either Auction or Fixed"
+        );
 
         IERC721(idToMarketItem[itemId].nftContract).transferFrom(
             msg.sender,
@@ -220,7 +253,11 @@ contract NFTMarket is ReentrancyGuard, Ownable {
             "Please submit the asking price in order to complete the purchase"
         );
 
-        idToMarketItem[itemId].seller.transfer(msg.value);
+        (bool successful, ) = payable(idToMarketItem[itemId].seller).call{
+            value: msg.value
+        }("");
+        require(successful, "Transfer to seller failed");
+
         IERC721(nftContract).transferFrom(address(this), msg.sender, tokenId);
         idToMarketItem[itemId].owner = payable(msg.sender);
         idToMarketItem[itemId].sold = 2;
@@ -235,13 +272,14 @@ contract NFTMarket is ReentrancyGuard, Ownable {
 
         MarketItem[] memory items = new MarketItem[](unsoldItemCount);
         for (uint256 i = 0; i < itemCount; i++) {
-            if (idToMarketItem[i + 1].owner == address(0)) {
+            if (idToMarketItem[i + 1].owner == address(this)) {
                 uint256 currentId = i + 1;
                 MarketItem storage currentItem = idToMarketItem[currentId];
                 items[currentIndex] = currentItem;
                 currentIndex += 1;
             }
         }
+
         return items;
     }
 
