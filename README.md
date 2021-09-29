@@ -4,4 +4,6 @@ TODO
 
 ** Make Contracts Upgradeable
 
+** Introduce governance feature in the NFT marketplace
+
 ** Allow other NFTs to be able to be listed on the marketplace
